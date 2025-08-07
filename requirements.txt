@@ -1,0 +1,7 @@
+transformers
+langchain
+langchain-core
+langchain-community
+langchain-chroma
+pdf2image
+chromadb

@@ -4,3 +4,4 @@ langchain-core
 langchain-community
 pdf2image
 langchain-text-splitters
+langgraph

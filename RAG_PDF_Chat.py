@@ -71,14 +71,15 @@ def build_ocr_prompt(b64_png: str) -> list:
     ]
 
 
-def transcribe_page(b64_png):
-    response = vision_llm.invoke(build_ocr_prompt(b64_png))
+def transcribe_page(vision_llm, page_b64_png):
+    response = vision_llm.invoke(build_ocr_prompt(page_b64_png))
     return response.content
 
 
 def extract_text_from_pdf(pdf_path: str) -> str:
+    vision_llm = ChatOllama(model="granite3.2-vision:latest", keep_alive="0")
     pages = pdf_pages_to_b64(pdf_path, dpi=400)
-    texts = list(map(transcribe_page, pages))
+    texts = list(map(lambda page: transcribe_page(vision_llm, page), pages))
     return "\n\n".join(texts)
 
 
@@ -110,34 +111,69 @@ def scan_pdf_locally(pdf_path: str) -> list[Document]:
                                table_strategy="lines",
                                extract_images=True,
                                images_parser=TesseractBlobParser())
+
     documents = loader.load()
     return documents
 
 
-if __name__ == "__main__":
+def scan_pdf_and_embed(model_embeddings, chroma_db_loc) -> Chroma:
+    """
+    Scans a PDF file, extracts text using both OCR and local parsing, splits the text into chunks,
+    and creates a Chroma vector store with the provided embeddings.
+
+    Args:
+        model_embeddings: Embedding model to use for the vector store.
+        chroma_db_loc: Directory path to persist the Chroma vector store.
+
+    Returns:
+        Chroma: A Chroma vector store containing the embedded text chunks from the PDF.
+    """
+    pdf_file = "RRB NTPC.pdf"
+    print(f"Extracting text from {pdf_file}...")
+    extracted_text_from_ocr = extract_text_from_pdf(pdf_file)
+    extracted_text_from_docs = extract_text_from_docs(scan_pdf_locally(pdf_file))
+    text = extracted_text_from_ocr + "\n\n" + extracted_text_from_docs
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50, length_function=len)
+    chunks = splitter.split_text(text)
+    chroma_vectorstore = Chroma.from_texts(chunks, model_embeddings, persist_directory=chroma_db_loc)
+    return chroma_vectorstore
+
+
+def get_retriever() -> Chroma.as_retriever:
+    """
+    Initializes and returns a retriever object for searching over a Chroma vector store.
+    If the Chroma database does not exist, it scans and embeds the PDF, otherwise it loads the existing vector store.
+
+    Returns:
+        BaseRetriever: A retriever for querying the vector store.
+    """
     chroma_db_loc = "./chroma_db"
     embeddings = OllamaEmbeddings(model="nomic-embed-text:latest")
     if not os.path.exists(chroma_db_loc):
-        vision_llm = ChatOllama(model="granite3.2-vision:latest", keep_alive="0")
-        pdf_file = "RRB NTPC.pdf"
-        print(f"Extracting text from {pdf_file}...")
-        extracted_text = extract_text_from_pdf(pdf_file)
-        extracted_text_from_docs = extract_text_from_docs(scan_pdf_locally(pdf_file))
-        text = extracted_text + "\n\n" + extracted_text_from_docs
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50, length_function=len)
-        chunks = splitter.split_text(text)
-        vectorstore = Chroma.from_texts(chunks, embeddings, persist_directory=chroma_db_loc)
+        vectorstore = scan_pdf_and_embed(embeddings, chroma_db_loc)
     else:
         vectorstore = Chroma(persist_directory=chroma_db_loc, embedding_function=embeddings)
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    return vectorstore.as_retriever(search_kwargs={"k": 3})
+
+
+def generate_chain(context_retriever):
+    """
+    Generates a chain for question answering using a retriever and a language model.
+
+    Args:
+        context_retriever: The retriever to use for fetching context.
+
+    Returns:
+        Chain: A chain that processes user input and generates answers.
+    """
     search_llm = ChatOllama(model="llama3.1:8b", keep_alive="0")
     system_prompt = (
         """
         You are a helpful AI assistant.
         You can answer questions based on the provided context.
         Also you can answer general questions that does not require context.
-        Use three sentence maximum and keep the answer concise.
+        Your answer should be crisp, concise and to-the-point.
         Context: {context}
         """
     )
@@ -146,18 +182,28 @@ if __name__ == "__main__":
         ("human", "Question: {input}")
     ])
 
-    chain = (
-            {"context": retriever, "input": RunnablePassthrough()}
+    search_chain = (
+            {"context": context_retriever, "input": RunnablePassthrough()}
             | prompt_template
             | search_llm
             | StrOutputParser()
     )
 
+    return search_chain
+
+
+def interactive_chat():
+    retriever = get_retriever()
+    chain = generate_chain(retriever)
     while True:
-        user_input = input("\n Enter your question (or type 'exit' to quit): \n")
+        user_input = input("\nEnter your question (or type 'exit' to quit): \n")
         if user_input.lower() == 'exit':
             print("Exiting the chat. Goodbye!")
             break
 
         llm_response = chain.invoke(user_input)
-        print("\n** Answer **: ", llm_response)
+        print("\n**Answer**: \n", llm_response)
+
+
+if __name__ == "__main__":
+    interactive_chat()
